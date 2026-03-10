@@ -57,15 +57,6 @@ class VideoMaMaPipelineLoader:
                     "max": 25,
                     "step": 1
                 }),
-                "attention_mode": (["auto", "xformers", "sdpa", "none"], {
-                    "default": "auto"
-                }),
-                "enable_vae_tiling": ("BOOLEAN", {
-                    "default": False
-                }),
-                "enable_vae_slicing": ("BOOLEAN", {
-                    "default": True
-                }),
             }
         }
 
@@ -79,10 +70,7 @@ class VideoMaMaPipelineLoader:
         unet_checkpoint_path: str,
         precision: str,
         enable_model_cpu_offload: bool,
-        vae_encode_chunk_size: int,
-        attention_mode: str,
-        enable_vae_tiling: bool,
-        enable_vae_slicing: bool
+        vae_encode_chunk_size: int
     ):
         """Load the VideoMaMa inference pipeline"""
         weight_dtype = torch.float16 if precision == "fp16" else torch.bfloat16
@@ -110,9 +98,6 @@ class VideoMaMaPipelineLoader:
         print(f"  UNet checkpoint: {unet_checkpoint_path}")
         print(f"  Model CPU Offload: {enable_model_cpu_offload}")
         print(f"  VAE Encode Chunk Size: {vae_encode_chunk_size}")
-        print(f"  Attention Mode: {attention_mode}")
-        print(f"  VAE Tiling: {enable_vae_tiling}")
-        print(f"  VAE Slicing: {enable_vae_slicing}")
 
         try:
             pipeline = VideoInferencePipeline(
@@ -121,10 +106,7 @@ class VideoMaMaPipelineLoader:
                 weight_dtype=weight_dtype,
                 device="cuda" if torch.cuda.is_available() else "cpu",
                 enable_model_cpu_offload=enable_model_cpu_offload,
-                vae_encode_chunk_size=vae_encode_chunk_size,
-                attention_mode=attention_mode,
-                enable_vae_tiling=enable_vae_tiling,
-                enable_vae_slicing=enable_vae_slicing
+                vae_encode_chunk_size=vae_encode_chunk_size
             )
             print(f"VideoMaMa pipeline loaded successfully with {precision} precision")
             return (pipeline,)
@@ -132,36 +114,7 @@ class VideoMaMaPipelineLoader:
             raise RuntimeError(f"Failed to load VideoMaMa pipeline: {e}")
 
 
-def _ensure_2d_mask(mask_np: np.ndarray) -> np.ndarray:
-    """Ensure mask array is 2D (H, W) for PIL grayscale mode.
-
-    Some mask sources (e.g. MatAnyone) output masks with extra dimensions
-    like [C, H, W] or [H, W, C] instead of the standard ComfyUI [H, W].
-    This helper squeezes/removes those extra dimensions.
-    """
-    if mask_np.ndim == 2:
-        return mask_np
-    if mask_np.ndim == 3:
-        # [1, H, W] -> [H, W]  or  [H, W, 1] -> [H, W]
-        if mask_np.shape[0] == 1:
-            return mask_np[0]
-        if mask_np.shape[-1] == 1:
-            return mask_np[:, :, 0]
-    # General fallback: squeeze all singleton dimensions
-    mask_np = np.squeeze(mask_np)
-    if mask_np.ndim == 2:
-        return mask_np
-    # If still not 2D, take first slice along leading dims until 2D
-    while mask_np.ndim > 2:
-        mask_np = mask_np[0]
-    return mask_np
-
-
 class VideoMaMaSampler:
-    """
-    Runs VideoMaMa inference on video frames with mask conditioning.
-    Expects ComfyUI IMAGE format: [B, H, W, C] tensors with values in [0, 1].
-    """
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -170,32 +123,42 @@ class VideoMaMaSampler:
                 "pipeline": ("VIDEOMAMA_PIPELINE",),
                 "images": ("IMAGE",),
                 "masks": ("MASK",),
-                "seed": ("INT", {
-                    "default": 42,
-                    "min": 0,
-                    "max": 0xffffffffffffffff
-                }),
+
+                "seed": ("INT", {"default": 42, "min": 0, "max": 0xffffffffffffffff}),
+
                 "max_resolution": ("INT", {
                     "default": 1024,
                     "min": 256,
                     "max": 2048,
                     "step": 8
                 }),
-                "fps": ("INT", {
-                    "default": 7,
-                    "min": 1,
-                    "max": 60
-                }),
+
+                "fps": ("INT", {"default": 7, "min": 1, "max": 60}),
+
                 "motion_bucket_id": ("INT", {
                     "default": 127,
                     "min": 1,
                     "max": 255
                 }),
+
                 "noise_aug_strength": ("FLOAT", {
                     "default": 0.0,
                     "min": 0.0,
-                    "max": 1.0,
-                    "step": 0.01
+                    "max": 1.0
+                }),
+
+                "batch_size": ("INT", {
+                    "default": 16,
+                    "min": 1,
+                    "max": 256
+                }),
+
+                "output_folder": ("STRING", {
+                    "default": "videomama_masks"
+                }),
+
+                "resume": ("BOOLEAN", {
+                    "default": True
                 }),
             }
         }
@@ -205,91 +168,157 @@ class VideoMaMaSampler:
     CATEGORY = "VideoMaMa"
 
     @staticmethod
-    def _compute_target_size(width: int, height: int, max_resolution: int):
-        """Compute target size preserving aspect ratio with longest axis = max_resolution, aligned to 8."""
+    def _compute_target_size(width, height, max_resolution):
+
         if width >= height:
-            new_width = max_resolution
-            new_height = int(height * max_resolution / width)
+            new_w = max_resolution
+            new_h = int(height * max_resolution / width)
         else:
-            new_height = max_resolution
-            new_width = int(width * max_resolution / height)
-        # Align to multiple of 8
-        new_width = max((new_width // 8) * 8, 8)
-        new_height = max((new_height // 8) * 8, 8)
-        return new_width, new_height
+            new_h = max_resolution
+            new_w = int(width * max_resolution / height)
+
+        new_w = max((new_w // 8) * 8, 8)
+        new_h = max((new_h // 8) * 8, 8)
+
+        return new_w, new_h
 
     def run_inference(
         self,
         pipeline,
         images,
         masks,
-        seed: int,
-        max_resolution: int,
-        fps: int,
-        motion_bucket_id: int,
-        noise_aug_strength: float
+        seed,
+        max_resolution,
+        fps,
+        motion_bucket_id,
+        noise_aug_strength,
+        batch_size,
+        output_folder,
+        resume
     ):
-        """Run VideoMaMa inference"""
+
+        import torch.nn.functional as F
+        import gc
+        from pathlib import Path
+
         num_frames = images.shape[0]
 
         if masks.shape[0] != num_frames:
-            raise ValueError(
-                f"Number of image frames ({num_frames}) must match "
-                f"number of mask frames ({masks.shape[0]})"
-            )
+            raise ValueError("Images and masks must have same frame count")
 
-        # Compute target resolution preserving aspect ratio
         orig_h, orig_w = images.shape[1], images.shape[2]
         target_w, target_h = self._compute_target_size(orig_w, orig_h, max_resolution)
-        print(f"Input resolution: {orig_w}x{orig_h} -> Target resolution: {target_w}x{target_h} (max_resolution={max_resolution})")
 
-        # Convert to PIL Images and resize to target resolution
-        cond_frames = []
-        mask_frames = []
+        print(f"Resolution {orig_w}x{orig_h} -> {target_w}x{target_h}")
+        print(f"Batch size: {batch_size}")
+        print(f"Frames: {num_frames}")
 
-        for i in range(num_frames):
-            img_np = (images[i].cpu().numpy() * 255).astype(np.uint8)
-            img_pil = Image.fromarray(img_np, mode='RGB')
-            cond_frames.append(img_pil.resize((target_w, target_h), Image.LANCZOS))
+        output_dir = Path(output_folder)
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-            mask_np = (masks[i].cpu().numpy() * 255).astype(np.uint8)
-            mask_np = _ensure_2d_mask(mask_np)
-            mask_pil = Image.fromarray(mask_np, mode='L')
-            mask_frames.append(mask_pil.resize((target_w, target_h), Image.LANCZOS))
+        existing = set()
 
-        print(f"Running VideoMaMa inference on {num_frames} frames...")
+        if resume:
+            for f in output_dir.glob("mask_*.png"):
+                try:
+                    idx = int(f.stem.split("_")[1])
+                    existing.add(idx)
+                except:
+                    pass
 
-        # Create progress bar for ComfyUI (4 steps: CLIP encode, VAE encode, UNet, VAE decode)
-        pbar = ProgressBar(4)
+        pbar = ProgressBar(num_frames)
 
         try:
-            output_frames_pil = pipeline.run(
-                cond_frames=cond_frames,
-                mask_frames=mask_frames,
-                seed=seed,
-                fps=fps,
-                motion_bucket_id=motion_bucket_id,
-                noise_aug_strength=noise_aug_strength,
-                pbar=pbar
-            )
 
-            # Convert back to ComfyUI MASK format [B, H, W] at original resolution
-            output_masks = []
-            for frame_pil in output_frames_pil:
-                # Resize back to original input resolution
-                frame_pil = frame_pil.resize((orig_w, orig_h), Image.LANCZOS)
-                frame_np = np.array(frame_pil).astype(np.float32) / 255.0
-                # Convert to grayscale if RGB
-                if len(frame_np.shape) == 3:
-                    frame_np = frame_np.mean(axis=-1)
-                output_masks.append(frame_np)
+            for start in range(0, num_frames, batch_size):
 
-            output_tensor = torch.from_numpy(np.stack(output_masks, axis=0))
-            print(f"VideoMaMa inference completed: {output_tensor.shape}")
-            return (output_tensor,)
+                end = min(start + batch_size, num_frames)
+
+                indices = list(range(start, end))
+
+                if resume:
+                    indices = [i for i in indices if i not in existing]
+
+                if not indices:
+                    pbar.update(end - start)
+                    continue
+
+                print(f"Processing {indices[0]}-{indices[-1]}")
+
+                batch_frames = []
+                batch_masks = []
+
+                for i in indices:
+
+                    img = images[i].permute(2,0,1).unsqueeze(0)
+
+                    img = F.interpolate(
+                        img,
+                        size=(target_h, target_w),
+                        mode="bilinear",
+                        align_corners=False
+                    )
+
+                    img_np = (img.squeeze().permute(1,2,0).cpu().numpy()*255).astype(np.uint8)
+
+                    batch_frames.append(Image.fromarray(img_np,"RGB"))
+
+                    mask = masks[i].unsqueeze(0).unsqueeze(0)
+
+                    mask = F.interpolate(
+                        mask,
+                        size=(target_h,target_w),
+                        mode="nearest"
+                    )
+
+                    mask_np = (mask.squeeze().cpu().numpy()*255).astype(np.uint8)
+
+                    batch_masks.append(Image.fromarray(mask_np,"L"))
+
+                out = pipeline.run(
+                    cond_frames=batch_frames,
+                    mask_frames=batch_masks,
+                    seed=seed,
+                    fps=fps,
+                    motion_bucket_id=motion_bucket_id,
+                    noise_aug_strength=noise_aug_strength
+                )
+
+                for idx,frame in zip(indices,out):
+
+                    frame.save(output_dir / f"mask_{idx:05d}.png")
+
+                pbar.update(len(indices))
+
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+                gc.collect()
 
         except Exception as e:
             raise RuntimeError(f"VideoMaMa inference failed: {e}")
+
+        output_masks=[]
+
+        for i in range(num_frames):
+
+            path=output_dir/f"mask_{i:05d}.png"
+
+            frame=Image.open(path)
+            frame=frame.resize((orig_w,orig_h),Image.LANCZOS)
+
+            frame_np=np.array(frame).astype(np.float32)/255.0
+
+            if len(frame_np.shape)==3:
+                frame_np=frame_np.mean(axis=-1)
+
+            output_masks.append(frame_np)
+
+        output_tensor=torch.from_numpy(np.stack(output_masks))
+
+        print("VideoMaMa finished",output_tensor.shape)
+
+        return (output_tensor,)
 
 
 class SAM2VideoMaskGenerator:
@@ -312,6 +341,8 @@ class SAM2VideoMaskGenerator:
                     "multiline": False
                 }),
             },
+            
+            
             "hidden": {
                 "points_x": ("STRING", {"default": "512"}),
                 "points_y": ("STRING", {"default": "288"}),
